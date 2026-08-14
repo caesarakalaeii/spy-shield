@@ -187,7 +187,15 @@
           # Read-only, so no need_writable_checkout: when there is no checkout
           # in reach, $REPO_ROOT is the store snapshot of this same source and
           # linting it yields the same verdict.
-          text = ''ruff check "''${@:-$REPO_ROOT}"'';
+          #
+          # --no-cache because ruff writes its .ruff_cache into the PROCESS's
+          # cwd, not next to the files it was pointed at, so anchoring the path
+          # argument alone still littered the caller's directory. There is no
+          # cwd-independent place to send it instead: --cache-dir
+          # "$REPO_ROOT/.ruff_cache" would fail precisely when $REPO_ROOT is the
+          # read-only snapshot, which is the case this exists for. At four files
+          # the cache is worth single-digit milliseconds, so it costs nothing.
+          text = ''ruff check --no-cache "''${@:-$REPO_ROOT}"'';
         };
         fmt = {
           description = "ruff format (rewrites files; this repo, args override)";
@@ -196,13 +204,15 @@
           # sat in the caller's directory, in some unrelated project, with this
           # repo's formatter. `set --` rather than an inline "''${@:-...}" so the
           # guard can run in the no-argument branch only: an explicit path is
-          # the caller's own instruction and is forwarded untouched.
+          # the caller's own instruction and is forwarded untouched. --no-cache
+          # for the reason given under `lint`, which applies to `ruff format`
+          # too -- it drops the same directory in the same wrong place.
           text = ''
             if [ "$#" -eq 0 ]; then
               need_writable_checkout
               set -- "$REPO_ROOT"
             fi
-            ruff format "$@"
+            ruff format --no-cache "$@"
           '';
         };
         run = {
