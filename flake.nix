@@ -19,8 +19,13 @@
 
   outputs =
     # `...` rather than a closed { self, nixpkgs }: adding a second input later
-    # would otherwise fail with "called with unexpected argument 'self'".
-    { nixpkgs, ... }:
+    # would otherwise fail with "called with unexpected argument '<name>'".
+    #
+    # `self` is load-bearing here, not decoration. It is the store snapshot of
+    # this repo's own source, and it is the only thing a command can anchor
+    # itself to when it was invoked as `nix run /path/to/repo#lint` from an
+    # unrelated directory -- see rootPreamble.
+    { self, nixpkgs, ... }:
     let
       lib = nixpkgs.lib;
 
@@ -153,33 +158,69 @@
       #   test   there is no test suite, and no CI workflow that pretends there
       #          is. Add `test` here the day a tests/ directory exists.
       #
-      # `text` is bash under `set -euo pipefail`, shellcheck'd at BUILD time, and
-      # it runs in the caller's current directory. Rules for writing one:
-      #   * always end with a quoted "$@" -- unquoted $@ fails the build (SC2068)
-      #   * $REPO_ROOT is pre-set to the git top level; use it for anything
-      #     stateful, never a bare relative path
+      # `text` is bash under `set -euo pipefail`, shellcheck'd at BUILD time. It
+      # starts in the caller's current directory but must never ACT on it.
+      # Rules for writing one:
+      #   * a bare trailing "$@" is a bug, not the convention. With no arguments
+      #     it expands to nothing, and the tool then defaults to `.` -- the
+      #     caller's cwd, not this repo. Anchor the no-argument case to
+      #     $REPO_ROOT (`"''${@:-$REPO_ROOT}"`) or cd there first, and keep
+      #     forwarding explicit arguments untouched. Never unquoted $@ -- that
+      #     fails the build (SC2068).
+      #   * $REPO_ROOT is this repo, resolved by rootPreamble; use it for
+      #     anything stateful, never a bare relative path
+      #   * anything that WRITES calls need_writable_checkout first, because
+      #     $REPO_ROOT can legitimately be the read-only store snapshot
       #   * pass the batch/non-interactive flag to anything that could prompt:
       #     there is no tty, so a prompt hangs until the agent's timeout
       #   * say "(network)" in the description of anything that needs it
       commands = pkgs: {
         lint = {
-          description = "ruff check";
-          text = ''ruff check "$@"'';
+          description = "ruff check (this repo; args override)";
+          # `ruff check "$@"` -- the first cut of this line -- was a gate that
+          # lied. With no arguments ruff falls back to `.`, so `nix run
+          # /path/to/repo#lint` from anywhere else printed "All checks passed!"
+          # and exited 0 having read none of this repo, while the same verb run
+          # from inside it exited 1 on 31 findings. The flake-URL form is what
+          # CI and a cold agent use, so that was the form that was green.
+          #
+          # Read-only, so no need_writable_checkout: when there is no checkout
+          # in reach, $REPO_ROOT is the store snapshot of this same source and
+          # linting it yields the same verdict.
+          text = ''ruff check "''${@:-$REPO_ROOT}"'';
         };
         fmt = {
-          description = "ruff format (rewrites files)";
-          text = ''ruff format "$@"'';
+          description = "ruff format (rewrites files; this repo, args override)";
+          # The mutating half of the same defect, and the worse one: a bare "$@"
+          # here meant `nix run /path/to/repo#fmt` REWROTE whatever .py files
+          # sat in the caller's directory, in some unrelated project, with this
+          # repo's formatter. `set --` rather than an inline "''${@:-...}" so the
+          # guard can run in the no-argument branch only: an explicit path is
+          # the caller's own instruction and is forwarded untouched.
+          text = ''
+            if [ "$#" -eq 0 ]; then
+              need_writable_checkout
+              set -- "$REPO_ROOT"
+            fi
+            ruff format "$@"
+          '';
         };
         run = {
           description = "(network) serve the Quart app on config.json's app_port";
-          # Two deviations from the fleet default, both forced by the source:
-          #
-          # `cd "$REPO_ROOT"` -- commands normally act on the caller's cwd on
-          # purpose, but main.py hardcodes cwd-relative paths it cannot be told
-          # about: read_json_file('config.json'), write_to_json_file(...,
+          # `cd "$REPO_ROOT"` is how this verb anchors itself, and here the cd
+          # is not merely tidier than a path argument, it is the only option:
+          # main.py hardcodes cwd-relative paths it cannot be told about --
+          # read_json_file('config.json'), write_to_json_file(...,
           # 'tracked_ids.json') and Logger(file_URI='logs/log.txt'). Without the
           # cd, invoking this from a subdirectory silently forks a second set of
-          # tracked IDs and log files.
+          # tracked IDs and log files, and invoking it from another project
+          # scatters them there.
+          #
+          # need_writable_checkout runs unconditionally, unlike in `fmt`: those
+          # three paths are written no matter what arguments are passed, so a
+          # $REPO_ROOT pointing at the read-only store snapshot cannot work. It
+          # fires before the config.json check because "no checkout in reach" is
+          # the more fundamental of the two complaints.
           #
           # A bare `python`, not "$REPO_ROOT/.venv/bin/python" -- this repo has
           # no venv, and the wrappers prepend the toolchain above to PATH, so the
@@ -194,6 +235,7 @@
           # "(network)" in the description because serving is the point: the app
           # calls out to config.json's api_endpoint on every submitted ID.
           text = ''
+            need_writable_checkout
             cd "$REPO_ROOT"
             if [ ! -f config.json ]; then
               echo "config.json not found in $REPO_ROOT (it is gitignored)." >&2
@@ -221,13 +263,61 @@
           export LD_LIBRARY_PATH="${lib.makeLibraryPath (nativeLibs pkgs)}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         '';
 
-      # Every command gets $REPO_ROOT. `nix run` and `nix develop` both start in
-      # whatever directory they were invoked from, so a bare `.venv` silently
-      # forks a second environment as soon as an agent works from a subdirectory.
-      # Note we do NOT cd there: commands act on the caller's cwd on purpose.
+      # Every command gets $SRC_ROOT and $REPO_ROOT. `nix run` and `nix develop`
+      # both start in whatever directory they were invoked from, and no verb may
+      # act on that directory -- these two are what it acts on instead.
+      #
+      # $SRC_ROOT is this flake's own source, snapshotted into the store when
+      # the flake was evaluated. It is the one anchor that is always available:
+      # `nix run /path/to/repo#lint` tells the running program nothing whatever
+      # about /path/to/repo (flake refs are location-independent by design, and
+      # there is no $FLAKE_DIR to read), so without `self` a wrapper invoked
+      # that way has literally no way to name the repo it belongs to. Its one
+      # limitation is that it is read-only, being a store path.
+      #
+      # $REPO_ROOT is the writable checkout when the caller is standing in one,
+      # and $SRC_ROOT when they are not. `git rev-parse --show-toplevel` alone
+      # is NOT enough to find that checkout: run from inside some OTHER git
+      # repo it cheerfully answers with THAT repo's top level, and a verb that
+      # trusts the answer formats a stranger's source tree. So a candidate has
+      # to prove it is a checkout of this flake, by carrying a byte-identical
+      # flake.nix. Compared with bash's own $(<file) rather than cmp or
+      # sha256sum, so the check depends on no package at all.
+      #
+      # Consequence worth knowing: edit flake.nix and the dev-* wrappers in an
+      # already-open `nix develop` stop recognising the tree, because they were
+      # built from the previous flake.nix. That is a stale shell telling you so
+      # -- re-enter it. `nix run` re-evaluates every time and never sees this.
       rootPreamble = ''
-        REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+        SRC_ROOT=${lib.escapeShellArg self}
+        export SRC_ROOT
+        REPO_ROOT="$SRC_ROOT"
+        _toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        if [ -n "$_toplevel" ] && [ -f "$_toplevel/flake.nix" ] &&
+          [ "$(<"$_toplevel/flake.nix")" = "$(<"$SRC_ROOT/flake.nix")" ]; then
+          REPO_ROOT="$_toplevel"
+        fi
+        unset _toplevel
         export REPO_ROOT
+      '';
+
+      # Wrappers only, not the shellHook -- an interactive shell has no business
+      # carrying this function around. Any command text that writes files calls
+      # it first, and it is the reason a mutating verb can fail loudly instead of
+      # falling back to "well, the cwd then".
+      guardPreamble = ''
+        need_writable_checkout() {
+          if [ "$REPO_ROOT" != "$SRC_ROOT" ]; then
+            return 0
+          fi
+          echo "This command rewrites files, so it needs a writable checkout of" >&2
+          echo "this repo -- and standing in $PWD there is none: no parent" >&2
+          echo "directory is a checkout of this flake. The only tree in reach is" >&2
+          echo "the read-only store snapshot $SRC_ROOT, and rewriting $PWD" >&2
+          echo "instead is exactly the bug this guard exists to prevent." >&2
+          echo "cd into the repo (or \`nix develop\` it), or pass an explicit path." >&2
+          exit 1
+        }
       '';
 
       # One derivation per command, reused by both `apps` and the dev shell, so
@@ -245,6 +335,7 @@
             meta.description = cmd.description;
             text = ''
               ${rootPreamble}
+              ${guardPreamble}
               ${ldPreamble pkgs}
               ${cmd.text}
             '';
