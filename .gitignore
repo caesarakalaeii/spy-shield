@@ -1,3 +1,12 @@
 /config.json
 /logs
 /__pycache__
+# nix
+result
+result-*
+.direnv/
+
+# python
+.venv/
+__pycache__/
+*.pyc
